@@ -6,6 +6,7 @@ This script implements the challenge specification:
 3. A feed-forward CIFAR-10 classifier built from PrunableLinear layers.
 4. A training loop using CrossEntropyLoss + lambda * L1(gates).
 5. Evaluation across multiple lambda values with accuracy, sparsity, and plots.
+6. Optional dense baseline and compression-style metrics for deployment analysis.
 
 Recommended run:
     python self_pruning_cifar10.py --device cuda
@@ -45,8 +46,19 @@ class ExperimentResult:
     gate_mean: float
     gate_min: float
     gate_max: float
+    total_gated_weights: int
+    active_gated_weights: int
+    pruned_gated_weights: int
+    compression_ratio: float
     best_epoch: int
     histogram_path: str
+    model_path: str
+
+
+@dataclass
+class BaselineResult:
+    test_accuracy: float
+    best_epoch: int
     model_path: str
 
 
@@ -149,6 +161,35 @@ class SelfPruningMLP(nn.Module):
             }
 
 
+class DenseMLP(nn.Module):
+    """Dense baseline with the same MLP shape but standard Linear layers."""
+
+    def __init__(
+        self,
+        input_dim: int = 3 * 32 * 32,
+        hidden_dims: tuple[int, ...] = (512, 256),
+        num_classes: int = 10,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        dims = [input_dim, *hidden_dims, num_classes]
+        layers: list[nn.Module] = []
+
+        for index in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[index], dims[index + 1]))
+            if index < len(dims) - 2:
+                layers.append(nn.ReLU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        flattened = torch.flatten(inputs, start_dim=1)
+        return self.network(flattened)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("./data"))
@@ -166,6 +207,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--run-baseline",
+        action="store_true",
+        help="Also train a dense MLP baseline for comparison.",
+    )
+    parser.add_argument(
+        "--baseline-epochs",
+        type=int,
+        default=None,
+        help="Epochs for dense baseline. Defaults to --epochs.",
+    )
     parser.add_argument(
         "--gradient-check",
         action="store_true",
@@ -275,12 +327,46 @@ def train_one_epoch(
     }
 
 
+def train_dense_one_epoch(
+    model: nn.Module,
+    data_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    num_batches = 0
+
+    for images, labels in data_loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        predictions = logits.argmax(dim=1)
+        correct += (predictions == labels).sum().item()
+        total += labels.size(0)
+        num_batches += 1
+        total_loss += loss.item()
+
+    return {
+        "train_loss": total_loss / num_batches,
+        "train_accuracy": correct / total * 100.0,
+    }
+
+
 @torch.no_grad()
 def evaluate(
-    model: SelfPruningMLP,
+    model: nn.Module,
     data_loader: DataLoader,
     device: torch.device,
-    gate_threshold: float,
+    gate_threshold: float | None = None,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -298,11 +384,13 @@ def evaluate(
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
 
-    return {
+    metrics = {
         "test_loss": total_loss / total,
         "test_accuracy": correct / total * 100.0,
-        "sparsity_level": model.sparsity_level(gate_threshold),
     }
+    if gate_threshold is not None and isinstance(model, SelfPruningMLP):
+        metrics["sparsity_level"] = model.sparsity_level(gate_threshold)
+    return metrics
 
 
 def save_gate_histogram(gates: torch.Tensor, output_path: Path, lambda_value: float) -> None:
@@ -320,6 +408,20 @@ def lambda_to_tag(lambda_value: float) -> str:
     return f"{lambda_value:.0e}".replace("-", "m").replace("+", "p")
 
 
+def gated_weight_counts(model: SelfPruningMLP, threshold: float) -> dict[str, float]:
+    with torch.no_grad():
+        gates = model.all_gate_values()
+        total = gates.numel()
+        active = int((gates >= threshold).sum().item())
+        pruned = total - active
+        return {
+            "total_gated_weights": total,
+            "active_gated_weights": active,
+            "pruned_gated_weights": pruned,
+            "compression_ratio": total / max(active, 1),
+        }
+
+
 def build_optimizer(model: SelfPruningMLP, args: argparse.Namespace) -> torch.optim.Optimizer:
     gate_params = []
     other_params = []
@@ -335,6 +437,65 @@ def build_optimizer(model: SelfPruningMLP, args: argparse.Namespace) -> torch.op
             {"params": other_params, "lr": args.learning_rate, "weight_decay": args.weight_decay},
             {"params": gate_params, "lr": args.gate_learning_rate, "weight_decay": 0.0},
         ]
+    )
+
+
+def run_dense_baseline(
+    args: argparse.Namespace,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    device: torch.device,
+) -> BaselineResult:
+    model = DenseMLP(dropout=args.dropout).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+
+    baseline_epochs = args.baseline_epochs or args.epochs
+    best_accuracy = -1.0
+    best_epoch = -1
+    best_state: dict[str, torch.Tensor] | None = None
+
+    print("\nStarting dense baseline")
+    for epoch in range(1, baseline_epochs + 1):
+        train_metrics = train_dense_one_epoch(model, train_loader, optimizer, device)
+        eval_metrics = evaluate(model, test_loader, device)
+
+        print(
+            f"[dense] epoch={epoch:02d} "
+            f"train_loss={train_metrics['train_loss']:.4f} "
+            f"train_acc={train_metrics['train_accuracy']:.2f}% "
+            f"test_acc={eval_metrics['test_accuracy']:.2f}%"
+        )
+
+        if eval_metrics["test_accuracy"] > best_accuracy:
+            best_accuracy = eval_metrics["test_accuracy"]
+            best_epoch = epoch
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+    assert best_state is not None, "Best dense baseline state should be captured during training."
+    model.load_state_dict(best_state)
+    final_metrics = evaluate(model, test_loader, device)
+
+    baseline_dir = args.output_dir / "dense_baseline"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    model_path = baseline_dir / "best_model.pt"
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "best_epoch": best_epoch,
+            "metrics": final_metrics,
+            "args": vars(args),
+        },
+        model_path,
+    )
+
+    return BaselineResult(
+        test_accuracy=final_metrics["test_accuracy"],
+        best_epoch=best_epoch,
+        model_path=str(model_path.resolve()),
     )
 
 
@@ -385,6 +546,7 @@ def run_experiment(
     model.load_state_dict(best_state)
     final_metrics = evaluate(model, test_loader, device, args.gate_threshold)
     final_gate_stats = model.gate_statistics(args.gate_threshold)
+    final_weight_counts = gated_weight_counts(model, args.gate_threshold)
 
     experiment_dir = args.output_dir / f"lambda_{lambda_to_tag(lambda_value)}"
     experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +561,7 @@ def run_experiment(
             "best_epoch": best_epoch,
             "metrics": final_metrics,
             "gate_statistics": final_gate_stats,
+            "gated_weight_counts": final_weight_counts,
             "args": vars(args),
         },
         model_path,
@@ -416,13 +579,21 @@ def run_experiment(
         gate_mean=final_gate_stats["gate_mean"],
         gate_min=final_gate_stats["gate_min"],
         gate_max=final_gate_stats["gate_max"],
+        total_gated_weights=int(final_weight_counts["total_gated_weights"]),
+        active_gated_weights=int(final_weight_counts["active_gated_weights"]),
+        pruned_gated_weights=int(final_weight_counts["pruned_gated_weights"]),
+        compression_ratio=final_weight_counts["compression_ratio"],
         best_epoch=best_epoch,
         histogram_path=str(histogram_path.resolve()),
         model_path=str(model_path.resolve()),
     )
 
 
-def save_results_table(results: list[ExperimentResult], output_dir: Path) -> tuple[Path, Path]:
+def save_results_table(
+    results: list[ExperimentResult],
+    output_dir: Path,
+    baseline_result: BaselineResult | None = None,
+) -> tuple[Path, Path]:
     csv_path = output_dir / "results.csv"
     json_path = output_dir / "results.json"
 
@@ -438,6 +609,10 @@ def save_results_table(results: list[ExperimentResult], output_dir: Path) -> tup
                 "gate_mean",
                 "gate_min",
                 "gate_max",
+                "total_gated_weights",
+                "active_gated_weights",
+                "pruned_gated_weights",
+                "compression_ratio",
                 "best_epoch",
             ],
         )
@@ -453,14 +628,42 @@ def save_results_table(results: list[ExperimentResult], output_dir: Path) -> tup
                     "gate_mean": f"{result.gate_mean:.6f}",
                     "gate_min": f"{result.gate_min:.6f}",
                     "gate_max": f"{result.gate_max:.6f}",
+                    "total_gated_weights": result.total_gated_weights,
+                    "active_gated_weights": result.active_gated_weights,
+                    "pruned_gated_weights": result.pruned_gated_weights,
+                    "compression_ratio": f"{result.compression_ratio:.4f}",
                     "best_epoch": result.best_epoch,
                 }
             )
 
     with json_path.open("w", encoding="utf-8") as json_file:
-        json.dump([asdict(result) for result in results], json_file, indent=2)
+        payload = {
+            "baseline": asdict(baseline_result) if baseline_result is not None else None,
+            "experiments": [asdict(result) for result in results],
+        }
+        json.dump(payload, json_file, indent=2)
 
     return csv_path, json_path
+
+
+def save_tradeoff_plot(results: list[ExperimentResult], output_dir: Path) -> Path:
+    plot_path = output_dir / "sparsity_accuracy_tradeoff.png"
+    sparsities = [result.sparsity_level for result in results]
+    accuracies = [result.test_accuracy for result in results]
+    labels = [f"{result.lambda_value:g}" for result in results]
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(sparsities, accuracies, marker="o", linewidth=2, color="#cc5500")
+    for x_value, y_value, label in zip(sparsities, accuracies, labels):
+        plt.annotate(f"lambda={label}", (x_value, y_value), textcoords="offset points", xytext=(6, 6))
+    plt.xlabel("Sparsity Level @ 1e-2 (%)")
+    plt.ylabel("Test Accuracy (%)")
+    plt.title("Sparsity vs Accuracy Trade-off")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=200)
+    plt.close()
+    return plot_path
 
 
 def choose_best_tradeoff(results: list[ExperimentResult]) -> ExperimentResult:
@@ -468,7 +671,12 @@ def choose_best_tradeoff(results: list[ExperimentResult]) -> ExperimentResult:
     return max(results, key=lambda item: item.test_accuracy + 0.02 * item.sparsity_level)
 
 
-def write_markdown_report(results: list[ExperimentResult], output_dir: Path) -> Path:
+def write_markdown_report(
+    results: list[ExperimentResult],
+    output_dir: Path,
+    baseline_result: BaselineResult | None = None,
+    tradeoff_plot_path: Path | None = None,
+) -> Path:
     best_accuracy_result = max(results, key=lambda item: item.test_accuracy)
     best_tradeoff_result = choose_best_tradeoff(results)
     report_path = output_dir / "report.md"
@@ -506,15 +714,37 @@ def write_markdown_report(results: list[ExperimentResult], output_dir: Path) -> 
         "",
         "## Results",
         "",
-        "| Lambda | Test Accuracy (%) | Sparsity Level @ 1e-2 (%) | Sparsity @ 0.05 (%) | Sparsity @ 0.10 (%) | Mean Gate |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Lambda | Test Accuracy (%) | Sparsity Level @ 1e-2 (%) | Active Gated Weights | Compression Ratio |",
+        "| --- | ---: | ---: | ---: | ---: |",
     ]
 
     for result in results:
         lines.append(
             f"| {result.lambda_value:g} | {result.test_accuracy:.2f} | "
-            f"{result.sparsity_level:.2f} | {result.sparsity_at_005:.2f} | "
-            f"{result.sparsity_at_010:.2f} | {result.gate_mean:.4f} |"
+            f"{result.sparsity_level:.2f} | {result.active_gated_weights:,} / "
+            f"{result.total_gated_weights:,} | {result.compression_ratio:.2f}x |"
+        )
+
+    if baseline_result is not None:
+        accuracy_drop = baseline_result.test_accuracy - best_tradeoff_result.test_accuracy
+        lines.extend(
+            [
+                "",
+                "## Dense Baseline Comparison",
+                "",
+                "| Model | Test Accuracy (%) | Sparsity Level (%) |",
+                "| --- | ---: | ---: |",
+                f"| Dense baseline | {baseline_result.test_accuracy:.2f} | 0.00 |",
+                (
+                    f"| Best trade-off pruned model (lambda = {best_tradeoff_result.lambda_value:g}) | "
+                    f"{best_tradeoff_result.test_accuracy:.2f} | {best_tradeoff_result.sparsity_level:.2f} |"
+                ),
+                "",
+                (
+                    f"The best trade-off model changes accuracy by {accuracy_drop:.2f} percentage points "
+                    "relative to the dense baseline while pruning a large fraction of gated weights."
+                ),
+            ]
         )
 
     lines.extend(
@@ -532,6 +762,21 @@ def write_markdown_report(results: list[ExperimentResult], output_dir: Path) -> 
             f"Best accuracy model: lambda = {best_accuracy_result.lambda_value:g}.",
             f"Best trade-off model: lambda = {best_tradeoff_result.lambda_value:g}.",
             "",
+        ]
+    )
+
+    if tradeoff_plot_path is not None:
+        lines.extend(
+            [
+                "## Sparsity vs Accuracy Plot",
+                "",
+                f"![Sparsity vs accuracy]({tradeoff_plot_path.resolve()})",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
             "## Best Trade-Off Gate Distribution",
             "",
             (
@@ -568,14 +813,19 @@ def main() -> None:
 
     train_loader, test_loader = get_dataloaders(args.data_dir, args.batch_size, args.num_workers)
 
+    baseline_result = None
+    if args.run_baseline:
+        baseline_result = run_dense_baseline(args, train_loader, test_loader, device)
+
     results: list[ExperimentResult] = []
     for lambda_value in lambda_values:
         print(f"\nStarting experiment with lambda={lambda_value:g}")
         result = run_experiment(lambda_value, args, train_loader, test_loader, device)
         results.append(result)
 
-    csv_path, json_path = save_results_table(results, args.output_dir)
-    report_path = write_markdown_report(results, args.output_dir)
+    tradeoff_plot_path = save_tradeoff_plot(results, args.output_dir)
+    csv_path, json_path = save_results_table(results, args.output_dir, baseline_result)
+    report_path = write_markdown_report(results, args.output_dir, baseline_result, tradeoff_plot_path)
 
     print("\nFinished all experiments.")
     print(f"Saved summary CSV to: {csv_path.resolve()}")
