@@ -9,7 +9,7 @@ This script implements the challenge specification:
 6. Optional dense baseline and compression-style metrics for deployment analysis.
 
 Recommended run:
-    python self_pruning_cifar10.py --device cuda
+    python self_pruning_learnable.py --device cuda
 """
 
 from __future__ import annotations
